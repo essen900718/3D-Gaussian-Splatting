@@ -1,3 +1,50 @@
+## 3D Gaussian Splatting
+
+### 3D Gaussian
+整個場景用無數個3D高斯(橢球)來顯性地表示，每個3D高斯各自維護以下資訊:
+1. mean: 每個高斯的位置(中心點)
+2. covariance matrix: 每個高斯的形狀(橢球形狀)
+3. opacity a: 每個高斯的不透明度
+4. spherical harmonic coefficients: 不同觀看視角下每個高斯的顏色
+
+### Rendering
+在建立好場景後，開始渲染時，會先將渲染畫面分為16*16的tile，接著計算每個高斯會覆蓋哪些tile，再做渲染
+而我們會需要知道以下資訊:
+1. 在2D螢幕上每個橢球的形狀(將橢球高斯視為一個圓形，只記錄半徑，半徑為近似後得到的)
+2. 每個近似的圓會覆蓋哪些像素
+3. 每個高斯相對於畫面的先後順序(每個tile各自獨立做先後順序的計算)
+4. 每個像素的顏色
+
+**1, 2**: ./submodules/diff-gaussian-raterization/cuda-rasterizer/forward.cu (preprocessCUDA, getRect)
+**3**: ./submodules/diff-gaussian-raterization/cuda-rasterizer/rasterizer_impl.cu (line:275-line:318)
+在實作時，會把每塊磁磚(tile簡稱)和每個高斯想像成是一個組合，例如磁磚1被高斯30、55覆蓋，磁磚2被高斯7、55覆蓋，把他們想像成(1, 30), (1, 55), (2, 7), (2, 55)組合，這樣一組的組合是一個64位元的整數(最後是高斯的深度32位元，其餘前面的位元為磁磚編號)，這樣直接用這個64位元的數字來排序，最終:**編號小的瓷磚會在前面、相同磁磚編號搭配深度較淺的高斯會在前面**
+**4**: ./submodules/diff-gaussian-raterization/cuda-rasterizer/forward.cu (renderCUDA)\
+在實作時，會把每個tile當作一個block，block裡面的threads當作tile裡的一個pixel，在每一個block裡面所有threads需要讀取的東西是一樣的，因此使用shared memory機制，讀取所有高斯資訊一次，可以直接被16*16個threads所使用
+
+### Optimizing
+整個場景有以下參數:
+1. g_points(3D位置): [G, 3]
+2. g_rgb(顏色): [G, 3]
+3. g_rotation(形狀，rotation of covariance matrix): [G, 4]
+4. g_scale(形狀，scale of covariance matrix): [G, 3]
+5. g_opacity(transparency): [G, 1]
+
+輸出為以下參數:
+1. p_rgb(): [P, 3]
+
+最後我們會得到: `dL/dP_rgb`，而我們要求的是對每個參數的偏微分: `dL/dG_p`, `dL/dG_rgb`, `dL/dG_rot`, `dL/dG_scale`, `dL/dG_opacity`
+因此我們要回溯整個流程，看某個像素的顏色是由哪個高斯所貢獻、貢獻多少，要反向傳播回所有有參與render的高斯
+
+back flow:
+color of a pixel: `C = c0a0 + c1a1(1-a0) + ...` --> a-compositing (由有參與的高斯的透明度和顏色組成)
+`dL/dG_rgb` = `dL/dc * dc/dG_rgb`、`dL/dG_opacity` = `dL/dc * dc/dG_opacity` 均可以用上面的公式微分
+
+而計算`dL/dG_p`時，高斯的位置會影響到alpha(`alpha = G_opacity * e^[(-1/2)(x-mu)^Tc(x-mu)] = G_opacity * e^[(-1/2)(c0dx^2 + 2c1dxdy + c2dy^2)]`，power = [(-1/2)(c0dx^2 + 2c1dxdy + c2dy^2)])，可以慢慢拆解成:
+`dL/dG_p` = `dL/dc * dc/dG_p` = `dL/dc * dc/da * da/dG_p` = `G_opacity * (de^power/dG_p)` = `e^power * (dpower/dG_p)`
+
+
+---
+
 # 3D Gaussian Splatting for Real-Time Radiance Field Rendering
 Bernhard Kerbl*, Georgios Kopanas*, Thomas Leimkühler, George Drettakis (* indicates equal contribution)<br>
 | [Webpage](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/) | [Full Paper](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/3d_gaussian_splatting_high.pdf) | [Video](https://youtu.be/T_kXY43VZnk) | [Other GRAPHDECO Publications](http://www-sop.inria.fr/reves/publis/gdindex.php) | [FUNGRAPH project page](https://fungraph.inria.fr) |<br>
